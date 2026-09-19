@@ -1,0 +1,18 @@
+syntax = "proto3";
+package jaeger.storage.v2;
+import "google/protobuf/timestamp.proto";
+
+message GetDependenciesRequest {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+}
+message Dependency {
+  string parent = 1;
+  string child = 2;
+  uint64 call_count = 3;
+  string source = 4;
+}
+message GetDependenciesResponse { repeated Dependency dependencies = 1; }
+service DependencyReader {
+  rpc GetDependencies(GetDependenciesRequest) returns (GetDependenciesResponse);
+}

@@ -1,0 +1,27 @@
+[package]
+name = "otelview-postgres"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "PostgreSQL remote storage for traces, logs and metrics — Jaeger v2 and otelview compatible"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-core = "0.3"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace", "logs", "metrics"] }
+prost = "0.14"
+prost-types = "0.14"
+sea-query = { version = "1.0", features = ["backend-postgres", "derive", "with-json"] }
+sea-query-sqlx = { version = "0.9", features = ["sqlx-postgres", "with-json"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"

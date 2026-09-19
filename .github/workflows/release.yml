@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Validate installer
+        run: sh -n install.sh
+      - name: Test
+        run: cargo test --locked
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install protobuf compiler on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Install protobuf compiler on macOS
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="otelview-postgres-${{ matrix.target }}"
+          mkdir -p "${package}/systemd"
+          cp "target/${{ matrix.target }}/release/otelview-postgres" "${package}/"
+          cp LICENSE README.md install.sh "${package}/"
+          cp systemd/otelview-postgres.service "${package}/systemd/"
+          tar -czf "${package}.tar.gz" "$package"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: otelview-postgres-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --verify-tag
+          --generate-notes
+          --title "${GITHUB_REF_NAME}"

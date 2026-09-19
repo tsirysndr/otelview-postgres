@@ -1,0 +1,35 @@
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=proto");
+
+    tonic_prost_build::configure()
+        .build_client(false)
+        .extern_path(
+            ".opentelemetry.proto.trace.v1",
+            "::opentelemetry_proto::tonic::trace::v1",
+        )
+        .extern_path(
+            ".opentelemetry.proto.logs.v1",
+            "::opentelemetry_proto::tonic::logs::v1",
+        )
+        .extern_path(
+            ".opentelemetry.proto.metrics.v1",
+            "::opentelemetry_proto::tonic::metrics::v1",
+        )
+        .extern_path(
+            ".opentelemetry.proto.common.v1",
+            "::opentelemetry_proto::tonic::common::v1",
+        )
+        .extern_path(
+            ".opentelemetry.proto.resource.v1",
+            "::opentelemetry_proto::tonic::resource::v1",
+        )
+        .compile_protos(
+            &[
+                "proto/jaeger/storage/v2/trace_storage.proto",
+                "proto/jaeger/storage/v2/dependency_storage.proto",
+                "proto/otelview/storage/v1/storage.proto",
+            ],
+            &["proto"],
+        )?;
+    Ok(())
+}

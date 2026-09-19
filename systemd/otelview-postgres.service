@@ -1,0 +1,31 @@
+[Unit]
+Description=otelview PostgreSQL remote storage (traces, logs, metrics)
+Documentation=https://github.com/tsirysndr/otelview-postgres
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/otelview-postgres/env
+ExecStart=/usr/local/bin/otelview-postgres
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Service hardening
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

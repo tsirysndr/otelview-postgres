@@ -1,0 +1,5 @@
+// Compile-time import shim. Rust uses the complete generated type from
+// opentelemetry-proto via build.rs's extern_path.
+syntax = "proto3";
+package opentelemetry.proto.trace.v1;
+message TracesData {}
