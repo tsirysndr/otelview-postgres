@@ -94,14 +94,19 @@ pub struct StoredSpan {
 
 #[derive(Clone)]
 pub struct Store {
-    pub(crate) pool: PgPool,
+    /// Primary connection: writes and migrations.
+    pub(crate) primary: PgPool,
+    /// Read connection: every query. Points at a read-only replica when one
+    /// is configured, otherwise it is the primary pool.
+    pub(crate) reader: PgPool,
     pub(crate) max_search_depth: u64,
 }
 
 impl Store {
-    pub fn new(pool: PgPool, max_search_depth: u64) -> Self {
+    pub fn new(primary: PgPool, reader: Option<PgPool>, max_search_depth: u64) -> Self {
         Self {
-            pool,
+            reader: reader.unwrap_or_else(|| primary.clone()),
+            primary,
             max_search_depth,
         }
     }
@@ -122,7 +127,7 @@ impl Store {
             ),
         ] {
             sqlx::raw_sql(sql)
-                .execute(&self.pool)
+                .execute(&self.primary)
                 .await
                 .with_context(|| format!("run database migration {name}"))?;
         }
@@ -186,7 +191,7 @@ impl Store {
 
         let deduped = dedupe_spans(&rows);
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         for chunk in deduped.chunks(INSERT_CHUNK_ROWS) {
             let mut statement = Query::insert();
             statement.into_table(Spans::Table).columns(SPAN_COLUMNS);
@@ -244,7 +249,7 @@ impl Store {
             .order_by(Spans::StartTimeUnixNano, Order::Asc)
             .build_sqlx(PostgresQueryBuilder);
         let rows = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?;
         rows.into_iter().map(row_to_span).collect()
     }
@@ -265,7 +270,7 @@ impl Store {
         apply_query(&mut select, query)?;
         let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
         let rows = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?;
         rows.into_iter()
             .map(|row| {
@@ -289,7 +294,7 @@ impl Store {
             .order_by(Spans::ServiceName, Order::Asc)
             .build_sqlx(PostgresQueryBuilder);
         Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?
             .into_iter()
             .map(|r| r.get("service_name"))
@@ -309,7 +314,7 @@ impl Store {
         }
         let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
         Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?
             .into_iter()
             .map(|r| Operation {
@@ -330,7 +335,7 @@ impl Store {
         )
         .bind(start)
         .bind(end)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.reader)
         .await?;
         Ok(rows
             .into_iter()

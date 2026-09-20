@@ -87,7 +87,7 @@ impl Store {
             return Ok(0);
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
             let mut statement = Query::insert();
             statement.into_table(Logs::Table).columns([
@@ -173,7 +173,7 @@ impl Store {
         }
         let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
         let rows = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await
             .context("query logs")?;
         rows.into_iter()
@@ -189,7 +189,7 @@ impl Store {
             .order_by(Logs::ServiceName, Order::Asc)
             .build_sqlx(PostgresQueryBuilder);
         Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?
             .into_iter()
             .map(|r| r.get("service_name"))

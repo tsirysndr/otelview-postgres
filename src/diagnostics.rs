@@ -25,7 +25,7 @@ impl Store {
                                            UNION SELECT service_name FROM metric_points) s) \
                         AS services",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&self.reader)
         .await
         .context("query storage stats")?;
         let get = |name: &str| -> Result<u64> {

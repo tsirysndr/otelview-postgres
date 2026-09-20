@@ -108,7 +108,7 @@ impl Store {
             return Ok(0);
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.primary.begin().await?;
         for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
             let mut statement = Query::insert();
             statement.into_table(MetricPoints::Table).columns([
@@ -176,7 +176,7 @@ impl Store {
         }
         let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
         let rows = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await
             .context("query metric points")?;
 
@@ -224,7 +224,7 @@ impl Store {
             .order_by(Alias::new("id"), Order::Desc)
             .build_sqlx(PostgresQueryBuilder);
         let descriptors = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await
             .context("list metric descriptors")?;
 
@@ -236,7 +236,7 @@ impl Store {
             .order_by(MetricPoints::ServiceName, Order::Asc)
             .build_sqlx(PostgresQueryBuilder);
         let pairs = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await
             .context("list metric services")?;
         let mut services: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -271,7 +271,7 @@ impl Store {
             .order_by(MetricPoints::ServiceName, Order::Asc)
             .build_sqlx(PostgresQueryBuilder);
         Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.reader)
             .await?
             .into_iter()
             .map(|r| r.get("service_name"))

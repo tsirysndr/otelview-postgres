@@ -84,6 +84,8 @@ if [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ] && [ "$install_systemd" = 1
             {
                 say '# Required: PostgreSQL connection string'
                 say 'DATABASE_URL='
+                say '# Optional: read-only replica for queries'
+                say '# DATABASE_READ_URL='
                 say '# LISTEN_ADDR=0.0.0.0:17271'
                 say '# DATABASE_MAX_CONNECTIONS=20'
                 say '# MAX_SEARCH_DEPTH=1000'

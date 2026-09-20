@@ -20,7 +20,7 @@ use otelview_postgres::{
     server::StorageServer,
     store::Store,
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::transport::Server;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -34,13 +34,35 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let config = Config::parse();
     let address: SocketAddr = config.listen_addr.parse().context("parse LISTEN_ADDR")?;
-    let pool = PgPoolOptions::new()
+    let primary = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .acquire_timeout(Duration::from_secs(10))
         .connect(&config.database_url)
         .await
         .context("connect to PostgreSQL from DATABASE_URL")?;
-    let store = Store::new(pool, config.max_search_depth);
+    let reader = match config.database_read_url.as_deref().filter(|u| !u.is_empty()) {
+        Some(read_url) => {
+            // Belt and braces: even if the URL points at the primary, the
+            // read pool's sessions cannot write.
+            let options = read_url
+                .parse::<PgConnectOptions>()
+                .context("parse DATABASE_READ_URL")?
+                .options([("default_transaction_read_only", "on")]);
+            let pool = PgPoolOptions::new()
+                .max_connections(config.database_max_connections)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect_with(options)
+                .await
+                .context("connect to PostgreSQL from DATABASE_READ_URL")?;
+            tracing::info!("read/write split enabled: queries use DATABASE_READ_URL");
+            Some(pool)
+        }
+        None => {
+            tracing::info!("DATABASE_READ_URL not set: primary serves reads and writes");
+            None
+        }
+    };
+    let store = Store::new(primary, reader, config.max_search_depth);
     store.migrate().await?;
     let service = StorageServer::new(store);
 

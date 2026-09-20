@@ -40,13 +40,24 @@ Optional environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `DATABASE_READ_URL` | unset | Optional read-only replica connection string (see below) |
 | `LISTEN_ADDR` | `0.0.0.0:17271` | Combined OTLP, Jaeger and otelview gRPC address |
-| `DATABASE_MAX_CONNECTIONS` | `20` | SQLx pool size |
+| `DATABASE_MAX_CONNECTIONS` | `20` | SQLx pool size (applied to each pool) |
 | `MAX_SEARCH_DEPTH` | `1000` | Upper bound for trace and log searches |
 | `RUST_LOG` | `otelview_postgres=info` | Log filter |
 
 Every gRPC request emits a start event, a completion event with busy/idle
 timings, and an error event when the RPC fails. Request payloads are not logged.
+
+### Read/write split
+
+Set `DATABASE_READ_URL` to a read-only replica and connections are split:
+every query (trace search, log search, metric series, stats, dependency
+graph) runs against the replica while OTLP writes and migrations stay on the
+primary `DATABASE_URL`. The read pool's sessions run with
+`default_transaction_read_only = on`, so they cannot write even if the URL
+points at the primary. When `DATABASE_READ_URL` is unset, the primary serves
+reads and writes through a single pool — no replica required.
 
 ### Use as an otelview backend
 
