@@ -1,6 +1,6 @@
 [package]
 name = "otelview-postgres"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "PostgreSQL remote storage for traces, logs and metrics — Jaeger v2 and otelview compatible"

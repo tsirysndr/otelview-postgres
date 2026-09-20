@@ -15,10 +15,10 @@ use prost::Message;
 use sea_query::{Alias, Expr, ExprTrait, Iden, Order, PostgresQueryBuilder, Query};
 use sea_query_sqlx::SqlxBinder;
 use serde_json::Value;
-use sqlx::{AssertSqlSafe, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, Row};
 
 use crate::proto::otelview::{MetricInfo, MetricQueryParameters};
-use crate::store::{Store, attributes_to_json, timestamp_to_nanos, u64_to_i64};
+use crate::store::{INSERT_CHUNK_ROWS, Store, attributes_to_json, timestamp_to_nanos, u64_to_i64};
 
 /// Hard bound on rows examined by one FindMetrics query, protecting memory
 /// before per-series downsampling kicks in.
@@ -53,11 +53,31 @@ struct FlatPoint {
     attributes: Value,
 }
 
+/// A `metric_points` row, materialised before the insert so a whole export can
+/// be written with a handful of multi-row statements.
+struct MetricRow {
+    name: String,
+    description: String,
+    unit: String,
+    metric_type: String,
+    service: String,
+    time: i64,
+    value: f64,
+    count: i64,
+    attributes: Value,
+    resource_attributes: Value,
+    payload: Vec<u8>,
+}
+
 impl Store {
     pub async fn write_metrics(&self, data: MetricsData) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        let mut written = 0u64;
-        for resource_metrics in data.resource_metrics {
+        // Flatten every point up front, then write in batches. A statement per
+        // point costs a network round-trip each, and a single export from an
+        // instrumented service routinely carries well over a thousand points:
+        // against a remote database that takes minutes, so the client times out
+        // and the surrounding transaction rolls back with nothing written.
+        let mut rows = Vec::new();
+        for resource_metrics in &data.resource_metrics {
             let resource_attrs = attributes_to_json(
                 resource_metrics
                     .resource
@@ -73,42 +93,25 @@ impl Store {
             for scope_metrics in &resource_metrics.scope_metrics {
                 for metric in &scope_metrics.metrics {
                     for point in flatten_metric(metric) {
-                        self.write_point(
-                            &mut tx,
-                            &resource_metrics,
+                        rows.push(metric_row(
+                            resource_metrics,
                             scope_metrics,
                             point,
                             &service,
                             &resource_attrs,
-                        )
-                        .await?;
-                        written += 1;
+                        )?);
                     }
                 }
             }
         }
-        tx.commit().await?;
-        Ok(written)
-    }
+        if rows.is_empty() {
+            return Ok(0);
+        }
 
-    async fn write_point(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        resource_metrics: &ResourceMetrics,
-        scope_metrics: &ScopeMetrics,
-        point: FlatPoint,
-        service: &str,
-        resource_attrs: &Value,
-    ) -> Result<()> {
-        let time = u64_to_i64(point.time, "metric timestamp")?;
-        let count = u64_to_i64(point.count, "metric count")?;
-        let metric_type = metric_type_str(&point.metric)
-            .ok_or_else(|| anyhow!("metric {} has no data", point.metric.name))?;
-        let payload =
-            singleton_payload(resource_metrics, scope_metrics, &point.metric).encode_to_vec();
-        let (sql, values) = Query::insert()
-            .into_table(MetricPoints::Table)
-            .columns([
+        let mut tx = self.pool.begin().await?;
+        for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
+            let mut statement = Query::insert();
+            statement.into_table(MetricPoints::Table).columns([
                 MetricPoints::MetricName,
                 MetricPoints::Description,
                 MetricPoints::Unit,
@@ -120,25 +123,29 @@ impl Store {
                 MetricPoints::Attributes,
                 MetricPoints::ResourceAttributes,
                 MetricPoints::Payload,
-            ])
-            .values_panic([
-                point.metric.name.clone().into(),
-                point.metric.description.clone().into(),
-                point.metric.unit.clone().into(),
-                metric_type.into(),
-                service.into(),
-                time.into(),
-                point.value.into(),
-                count.into(),
-                point.attributes.into(),
-                resource_attrs.clone().into(),
-                payload.into(),
-            ])
-            .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with(AssertSqlSafe(sql), values)
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
+            ]);
+            for row in chunk {
+                statement.values_panic([
+                    row.name.clone().into(),
+                    row.description.clone().into(),
+                    row.unit.clone().into(),
+                    row.metric_type.clone().into(),
+                    row.service.clone().into(),
+                    row.time.into(),
+                    row.value.into(),
+                    row.count.into(),
+                    row.attributes.clone().into(),
+                    row.resource_attributes.clone().into(),
+                    row.payload.clone().into(),
+                ]);
+            }
+            let (sql, values) = statement.build_sqlx(PostgresQueryBuilder);
+            sqlx::query_with(AssertSqlSafe(sql), values)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(rows.len() as u64)
     }
 
     /// Matching data-point payloads in time order, downsampled per series
@@ -284,6 +291,35 @@ fn downsample(indices: &[usize], max_points: usize) -> Vec<usize> {
     (0..max_points)
         .map(|i| indices[i * (indices.len() - 1) / (max_points - 1)])
         .collect()
+}
+
+/// Build the row for one flattened point, including its singleton OTLP payload.
+fn metric_row(
+    resource_metrics: &ResourceMetrics,
+    scope_metrics: &ScopeMetrics,
+    point: FlatPoint,
+    service: &str,
+    resource_attrs: &Value,
+) -> Result<MetricRow> {
+    let time = u64_to_i64(point.time, "metric timestamp")?;
+    let count = u64_to_i64(point.count, "metric count")?;
+    let metric_type = metric_type_str(&point.metric)
+        .ok_or_else(|| anyhow!("metric {} has no data", point.metric.name))?
+        .to_owned();
+    let payload = singleton_payload(resource_metrics, scope_metrics, &point.metric).encode_to_vec();
+    Ok(MetricRow {
+        name: point.metric.name.clone(),
+        description: point.metric.description.clone(),
+        unit: point.metric.unit.clone(),
+        metric_type,
+        service: service.to_owned(),
+        time,
+        value: point.value,
+        count,
+        attributes: point.attributes,
+        resource_attributes: resource_attrs.clone(),
+        payload,
+    })
 }
 
 /// Split a metric into per-point copies of itself: same descriptor, one data

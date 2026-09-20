@@ -12,10 +12,13 @@ use sea_query::{
 };
 use sea_query_sqlx::SqlxBinder;
 use serde_json::Value;
-use sqlx::{AssertSqlSafe, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, Row};
 
 use crate::proto::otelview::LogQueryParameters;
-use crate::store::{Store, attributes_to_json, otel_value_to_json, timestamp_to_nanos, u64_to_i64};
+use crate::store::{
+    INSERT_CHUNK_ROWS, Store, attributes_to_json, otel_value_to_json, timestamp_to_nanos,
+    u64_to_i64,
+};
 
 #[derive(Clone, Copy, Iden)]
 enum Logs {
@@ -33,11 +36,29 @@ enum Logs {
     Payload,
 }
 
+/// A `logs` row, materialised before the insert so a whole export can be
+/// written with a handful of multi-row statements.
+struct LogRow {
+    time: i64,
+    observed: i64,
+    severity_number: i32,
+    severity_text: String,
+    service: String,
+    trace_id: Vec<u8>,
+    span_id: Vec<u8>,
+    body: String,
+    attributes: Value,
+    resource_attributes: Value,
+    payload: Vec<u8>,
+}
+
 impl Store {
     pub async fn write_logs(&self, data: LogsData) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        let mut written = 0u64;
-        for resource_logs in data.resource_logs {
+        // Collected first, then written in batches: a statement per record
+        // costs a network round-trip each, which does not keep up with a busy
+        // exporter talking to a remote database.
+        let mut rows = Vec::new();
+        for resource_logs in &data.resource_logs {
             let resource_attrs = attributes_to_json(
                 resource_logs
                     .resource
@@ -52,43 +73,24 @@ impl Store {
                 .to_owned();
             for scope_logs in &resource_logs.scope_logs {
                 for record in &scope_logs.log_records {
-                    self.write_log(
-                        &mut tx,
-                        &resource_logs,
+                    rows.push(log_row(
+                        resource_logs,
                         scope_logs,
                         record,
                         &service,
                         &resource_attrs,
-                    )
-                    .await?;
-                    written += 1;
+                    )?);
                 }
             }
         }
-        tx.commit().await?;
-        Ok(written)
-    }
+        if rows.is_empty() {
+            return Ok(0);
+        }
 
-    async fn write_log(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        resource_logs: &ResourceLogs,
-        scope_logs: &ScopeLogs,
-        record: &LogRecord,
-        service: &str,
-        resource_attrs: &Value,
-    ) -> Result<()> {
-        let time = if record.time_unix_nano != 0 {
-            record.time_unix_nano
-        } else {
-            record.observed_time_unix_nano
-        };
-        let time = u64_to_i64(time, "log timestamp")?;
-        let observed = u64_to_i64(record.observed_time_unix_nano, "observed timestamp")?;
-        let payload = singleton_payload(resource_logs, scope_logs, record).encode_to_vec();
-        let (sql, values) = Query::insert()
-            .into_table(Logs::Table)
-            .columns([
+        let mut tx = self.pool.begin().await?;
+        for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
+            let mut statement = Query::insert();
+            statement.into_table(Logs::Table).columns([
                 Logs::TimeUnixNano,
                 Logs::ObservedTimeUnixNano,
                 Logs::SeverityNumber,
@@ -100,25 +102,29 @@ impl Store {
                 Logs::Attributes,
                 Logs::ResourceAttributes,
                 Logs::Payload,
-            ])
-            .values_panic([
-                time.into(),
-                observed.into(),
-                record.severity_number.into(),
-                record.severity_text.clone().into(),
-                service.into(),
-                record.trace_id.clone().into(),
-                record.span_id.clone().into(),
-                body_text(record).into(),
-                attributes_to_json(&record.attributes).into(),
-                resource_attrs.clone().into(),
-                payload.into(),
-            ])
-            .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with(AssertSqlSafe(sql), values)
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
+            ]);
+            for row in chunk {
+                statement.values_panic([
+                    row.time.into(),
+                    row.observed.into(),
+                    row.severity_number.into(),
+                    row.severity_text.clone().into(),
+                    row.service.clone().into(),
+                    row.trace_id.clone().into(),
+                    row.span_id.clone().into(),
+                    row.body.clone().into(),
+                    row.attributes.clone().into(),
+                    row.resource_attributes.clone().into(),
+                    row.payload.clone().into(),
+                ]);
+            }
+            let (sql, values) = statement.build_sqlx(PostgresQueryBuilder);
+            sqlx::query_with(AssertSqlSafe(sql), values)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(rows.len() as u64)
     }
 
     /// Matching log payloads, newest first, capped by the search depth.
@@ -189,6 +195,34 @@ impl Store {
             .map(|r| r.get("service_name"))
             .collect())
     }
+}
+
+/// Build the row for one log record, including its singleton OTLP payload.
+fn log_row(
+    resource_logs: &ResourceLogs,
+    scope_logs: &ScopeLogs,
+    record: &LogRecord,
+    service: &str,
+    resource_attrs: &Value,
+) -> Result<LogRow> {
+    let time = if record.time_unix_nano != 0 {
+        record.time_unix_nano
+    } else {
+        record.observed_time_unix_nano
+    };
+    Ok(LogRow {
+        time: u64_to_i64(time, "log timestamp")?,
+        observed: u64_to_i64(record.observed_time_unix_nano, "observed timestamp")?,
+        severity_number: record.severity_number,
+        severity_text: record.severity_text.clone(),
+        service: service.to_owned(),
+        trace_id: record.trace_id.clone(),
+        span_id: record.span_id.clone(),
+        body: body_text(record),
+        attributes: attributes_to_json(&record.attributes),
+        resource_attributes: resource_attrs.clone(),
+        payload: singleton_payload(resource_logs, scope_logs, record).encode_to_vec(),
+    })
 }
 
 fn singleton_payload(resource: &ResourceLogs, scope: &ScopeLogs, record: &LogRecord) -> LogsData {

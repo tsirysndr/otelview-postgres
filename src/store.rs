@@ -12,7 +12,7 @@ use sea_query::{
 };
 use sea_query_sqlx::SqlxBinder;
 use serde_json::{Value, json};
-use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use crate::proto::storage::{
     AnyValue, FoundTraceId, KeyValue, Operation, ServiceSummary, TraceQueryParameters,
@@ -36,6 +36,47 @@ enum Spans {
     ResourceAttributes,
     ScopeAttributes,
     Payload,
+}
+
+/// Rows per multi-row `INSERT`. Postgres caps a statement at 65535 bind
+/// parameters and the widest table here binds 14 per row, so this stays well
+/// inside the limit while collapsing a whole export into a few round-trips.
+pub(crate) const INSERT_CHUNK_ROWS: usize = 1_000;
+
+const SPAN_COLUMNS: [Spans; 14] = [
+    Spans::TraceId,
+    Spans::SpanId,
+    Spans::ParentSpanId,
+    Spans::ServiceName,
+    Spans::OperationName,
+    Spans::SpanKind,
+    Spans::StartTimeUnixNano,
+    Spans::EndTimeUnixNano,
+    Spans::DurationNano,
+    Spans::StatusCode,
+    Spans::SpanAttributes,
+    Spans::ResourceAttributes,
+    Spans::ScopeAttributes,
+    Spans::Payload,
+];
+
+/// A `spans` row, materialised before the insert so a whole export can be
+/// written with a handful of multi-row statements.
+struct SpanRow {
+    trace_id: Vec<u8>,
+    span_id: Vec<u8>,
+    parent_span_id: Vec<u8>,
+    service: String,
+    operation: String,
+    kind: String,
+    start: i64,
+    end: i64,
+    duration: i64,
+    status: i16,
+    span_attributes: Value,
+    resource_attributes: Value,
+    scope_attributes: Value,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +130,12 @@ impl Store {
     }
 
     pub async fn write(&self, data: TracesData) -> Result<(u64, Vec<String>)> {
-        let mut tx = self.pool.begin().await?;
         let mut rejected = 0;
         let mut errors = Vec::new();
+        // Collected first, then written in batches: a statement per span costs
+        // a network round-trip each, which does not keep up with a busy
+        // exporter talking to a remote database.
+        let mut rows: Vec<SpanRow> = Vec::new();
 
         for resource_spans in data.resource_spans {
             let resource_attrs = attributes_to_json(
@@ -128,91 +172,54 @@ impl Store {
                         }
                         continue;
                     }
-                    self.write_span(
-                        &mut tx,
+                    rows.push(span_row(
                         &resource_spans,
                         scope_spans,
                         span,
                         &service,
                         &resource_attrs,
                         &scope_attrs,
-                    )
-                    .await?;
+                    )?);
                 }
             }
         }
-        tx.commit().await?;
-        Ok((rejected, errors))
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn write_span(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        resource_spans: &ResourceSpans,
-        scope_spans: &ScopeSpans,
-        span: &Span,
-        service: &str,
-        resource_attrs: &Value,
-        scope_attrs: &Value,
-    ) -> Result<()> {
-        let start = u64_to_i64(span.start_time_unix_nano, "start timestamp")?;
-        let end = u64_to_i64(span.end_time_unix_nano, "end timestamp")?;
-        let duration = end.saturating_sub(start);
-        let status = span
-            .status
-            .as_ref()
-            .map(|s| s.code as i16)
-            .unwrap_or_default();
-        let payload = singleton_payload(resource_spans, scope_spans, span).encode_to_vec();
-        let span_attrs = attributes_to_json(&span.attributes);
+        let deduped = dedupe_spans(&rows);
 
-        let columns = [
-            Spans::TraceId,
-            Spans::SpanId,
-            Spans::ParentSpanId,
-            Spans::ServiceName,
-            Spans::OperationName,
-            Spans::SpanKind,
-            Spans::StartTimeUnixNano,
-            Spans::EndTimeUnixNano,
-            Spans::DurationNano,
-            Spans::StatusCode,
-            Spans::SpanAttributes,
-            Spans::ResourceAttributes,
-            Spans::ScopeAttributes,
-            Spans::Payload,
-        ];
-        let mut statement = Query::insert();
-        statement
-            .into_table(Spans::Table)
-            .columns(columns)
-            .values_panic([
-                span.trace_id.clone().into(),
-                span.span_id.clone().into(),
-                span.parent_span_id.clone().into(),
-                service.into(),
-                span.name.clone().into(),
-                span_kind(span.kind).into(),
-                start.into(),
-                end.into(),
-                duration.into(),
-                status.into(),
-                span_attrs.into(),
-                resource_attrs.clone().into(),
-                scope_attrs.clone().into(),
-                payload.into(),
-            ])
-            .on_conflict(
+        let mut tx = self.pool.begin().await?;
+        for chunk in deduped.chunks(INSERT_CHUNK_ROWS) {
+            let mut statement = Query::insert();
+            statement.into_table(Spans::Table).columns(SPAN_COLUMNS);
+            for row in chunk {
+                statement.values_panic([
+                    row.trace_id.clone().into(),
+                    row.span_id.clone().into(),
+                    row.parent_span_id.clone().into(),
+                    row.service.clone().into(),
+                    row.operation.clone().into(),
+                    row.kind.clone().into(),
+                    row.start.into(),
+                    row.end.into(),
+                    row.duration.into(),
+                    row.status.into(),
+                    row.span_attributes.clone().into(),
+                    row.resource_attributes.clone().into(),
+                    row.scope_attributes.clone().into(),
+                    row.payload.clone().into(),
+                ]);
+            }
+            statement.on_conflict(
                 OnConflict::columns([Spans::TraceId, Spans::SpanId])
-                    .update_columns(columns.into_iter().skip(2))
+                    .update_columns(SPAN_COLUMNS.into_iter().skip(2))
                     .to_owned(),
             );
-        let (sql, values) = statement.build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with(AssertSqlSafe(sql), values)
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
+            let (sql, values) = statement.build_sqlx(PostgresQueryBuilder);
+            sqlx::query_with(AssertSqlSafe(sql), values)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok((rejected, errors))
     }
 
     pub async fn spans_for_ids(&self, trace_ids: &[Vec<u8>]) -> Result<Vec<StoredSpan>> {
@@ -448,6 +455,56 @@ fn summarize(mut spans: Vec<StoredSpan>) -> TraceSummary {
     }
 }
 
+/// Keep one row per `(trace_id, span_id)`, in arrival order, preferring the
+/// last occurrence.
+///
+/// `ON CONFLICT DO UPDATE` refuses to touch the same row twice within a single
+/// statement, so batching spans is only safe once duplicates are collapsed.
+/// Keeping the last one matches the row-at-a-time behaviour this replaced,
+/// where a later write simply overwrote an earlier one.
+fn dedupe_spans(rows: &[SpanRow]) -> Vec<&SpanRow> {
+    let mut last_index: HashMap<(&[u8], &[u8]), usize> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        last_index.insert((&row.trace_id, &row.span_id), index);
+    }
+    let mut keep: Vec<usize> = last_index.into_values().collect();
+    keep.sort_unstable();
+    keep.into_iter().map(|i| &rows[i]).collect()
+}
+
+/// Build the row for one span, including its singleton OTLP payload.
+fn span_row(
+    resource_spans: &ResourceSpans,
+    scope_spans: &ScopeSpans,
+    span: &Span,
+    service: &str,
+    resource_attrs: &Value,
+    scope_attrs: &Value,
+) -> Result<SpanRow> {
+    let start = u64_to_i64(span.start_time_unix_nano, "start timestamp")?;
+    let end = u64_to_i64(span.end_time_unix_nano, "end timestamp")?;
+    Ok(SpanRow {
+        trace_id: span.trace_id.clone(),
+        span_id: span.span_id.clone(),
+        parent_span_id: span.parent_span_id.clone(),
+        service: service.to_owned(),
+        operation: span.name.clone(),
+        kind: span_kind(span.kind).to_owned(),
+        start,
+        end,
+        duration: end.saturating_sub(start),
+        status: span
+            .status
+            .as_ref()
+            .map(|s| s.code as i16)
+            .unwrap_or_default(),
+        span_attributes: attributes_to_json(&span.attributes),
+        resource_attributes: resource_attrs.clone(),
+        scope_attributes: scope_attrs.clone(),
+        payload: singleton_payload(resource_spans, scope_spans, span).encode_to_vec(),
+    })
+}
+
 fn singleton_payload(resource: &ResourceSpans, scope: &ScopeSpans, span: &Span) -> TracesData {
     TracesData {
         resource_spans: vec![ResourceSpans {
@@ -574,6 +631,52 @@ pub fn decode_payload(bytes: &[u8]) -> Result<TracesData> {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+
+    fn span_row_for(trace: u8, span: u8, operation: &str) -> SpanRow {
+        SpanRow {
+            trace_id: vec![trace; 16],
+            span_id: vec![span; 8],
+            parent_span_id: Vec::new(),
+            service: "svc".into(),
+            operation: operation.into(),
+            kind: "server".into(),
+            start: 0,
+            end: 1,
+            duration: 1,
+            status: 0,
+            span_attributes: json!({}),
+            resource_attributes: json!({}),
+            scope_attributes: json!({}),
+            payload: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dedupe_spans_keeps_last_write_per_id_in_order() {
+        let rows = vec![
+            span_row_for(1, 1, "first"),
+            span_row_for(2, 2, "other"),
+            // same (trace_id, span_id) as the first: a batch may only carry it
+            // once or Postgres rejects the whole statement.
+            span_row_for(1, 1, "second"),
+            span_row_for(1, 3, "different span, same trace"),
+        ];
+
+        let kept = dedupe_spans(&rows);
+
+        assert_eq!(kept.len(), 3);
+        // The duplicate collapses to its latest version, and the surviving
+        // rows stay in arrival order.
+        assert_eq!(kept[0].operation, "other");
+        assert_eq!(kept[1].operation, "second");
+        assert_eq!(kept[2].operation, "different span, same trace");
+    }
+
+    #[test]
+    fn dedupe_spans_preserves_distinct_rows() {
+        let rows = vec![span_row_for(1, 1, "a"), span_row_for(1, 2, "b")];
+        assert_eq!(dedupe_spans(&rows).len(), 2);
+    }
 
     #[test]
     fn negative_timestamp_round_trips() {
