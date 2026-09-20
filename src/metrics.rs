@@ -235,7 +235,10 @@ impl Store {
                 ])
                 .from(MetricPoints::Table)
                 .and_where(Expr::col(MetricPoints::MetricName).eq(&name))
-                .order_by(Alias::new("id"), Order::Desc)
+                // Newest by time, not by id: (metric_name, time_unix_nano)
+                // is indexed so this is one probe, where ordering by id made
+                // the planner sort every point of the metric.
+                .order_by(MetricPoints::TimeUnixNano, Order::Desc)
                 .limit(1)
                 .build_sqlx(PostgresQueryBuilder);
             let row = sqlx::query_with(AssertSqlSafe(sql), values)

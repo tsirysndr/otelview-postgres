@@ -333,24 +333,42 @@ impl Store {
     }
 
     pub async fn operations(&self, service: &str, kind: &str) -> Result<Vec<Operation>> {
-        let mut select = Query::select();
-        select
-            .columns([Spans::OperationName, Spans::SpanKind])
-            .distinct()
-            .from(Spans::Table)
-            .and_where(Expr::col(Spans::ServiceName).eq(service))
-            .order_by(Spans::OperationName, Order::Asc);
+        // Skip along the (service_name, operation_name, …) index prefix. A
+        // DISTINCT here walks every span of the service, and a busy one has
+        // hundreds of thousands — this listing was the one trace-page request
+        // still timing out after the whole-table scans were fixed. The kind
+        // filter joins each probe, so a filtered listing only ever lands on
+        // operations that have that kind; each row's kind comes back from the
+        // probe itself, one representative per operation rather than one row
+        // per (operation, kind) pair — the searchbox use of this listing
+        // keys on the name.
+        let kind_clause = if kind.is_empty() { "" } else { "AND span_kind = $2" };
+        let sql = format!(
+            r#"WITH RECURSIVE walk AS (
+                 (SELECT operation_name AS v, span_kind AS k FROM spans
+                  WHERE service_name = $1 {kind_clause}
+                  ORDER BY operation_name LIMIT 1)
+                 UNION ALL
+                 SELECT probe.v, probe.k FROM walk,
+                   LATERAL (SELECT operation_name AS v, span_kind AS k FROM spans
+                            WHERE service_name = $1 {kind_clause}
+                              AND operation_name > walk.v
+                            ORDER BY operation_name LIMIT 1) probe
+                 WHERE walk.v IS NOT NULL
+               )
+               SELECT v, k FROM walk WHERE v IS NOT NULL ORDER BY v"#,
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(service);
         if !kind.is_empty() {
-            select.and_where(Expr::col(Spans::SpanKind).eq(kind));
+            query = query.bind(kind);
         }
-        let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
-        Ok(sqlx::query_with(AssertSqlSafe(sql), values)
+        Ok(query
             .fetch_all(&self.reader)
             .await?
             .into_iter()
             .map(|r| Operation {
-                name: r.get("operation_name"),
-                span_kind: r.get("span_kind"),
+                name: r.get("v"),
+                span_kind: r.get("k"),
             })
             .collect())
     }
