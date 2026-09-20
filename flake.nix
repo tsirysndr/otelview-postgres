@@ -38,7 +38,7 @@
           commonArgs = {
             inherit src;
             pname = "otelview-postgres";
-            version = "0.1.3";
+            version = "0.1.4";
             strictDeps = true;
             nativeBuildInputs = [ pkgs.protobuf ];
             PROTOC = "${pkgs.protobuf}/bin/protoc";
