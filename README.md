@@ -127,7 +127,7 @@ sudo systemctl status otelview-postgres
 ```
 
 The installer intentionally does not start the service until `DATABASE_URL` is
-configured. Set `OTELVIEW_POSTGRES_VERSION=v0.1.0` to install a particular
+configured. Set `OTELVIEW_POSTGRES_VERSION=v0.1.2` to install a particular
 tag, `INSTALL_DIR` to change the binary destination, or `INSTALL_SYSTEMD=0` to
 skip the unit.
 
