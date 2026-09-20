@@ -22,6 +22,60 @@ ingested — histogram buckets, exemplars, quantiles and schema URLs included.
 Indexed columns and JSONB attribute copies support service, operation, time,
 duration, severity, trace-correlation and attribute searches.
 
+## Install a release
+
+The installer detects macOS ARM64, Linux x86_64, or Linux ARM64 and verifies the
+download against the release checksums:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/tsirysndr/otelview-postgres/main/install.sh | sh
+```
+
+A root Linux installation also places the unit at
+`/etc/systemd/system/otelview-postgres.service` and creates a private
+environment file. Install system-wide, configure, and start it with:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/tsirysndr/otelview-postgres/main/install.sh | sudo sh
+sudo editor /etc/otelview-postgres/env
+sudo systemctl enable --now otelview-postgres
+sudo systemctl status otelview-postgres
+```
+
+The installer intentionally does not start the service until `DATABASE_URL` is
+configured. Set `OTELVIEW_POSTGRES_VERSION=v0.1.2` to install a particular
+tag, `INSTALL_DIR` to change the binary destination, or `INSTALL_SYSTEMD=0` to
+skip the unit.
+
+Tags matching `v*` trigger release builds for Darwin ARM64, Linux x86_64, and
+Linux ARM64. The workflow publishes all three archives and `SHA256SUMS` to the
+corresponding GitHub release.
+
+## Install with Nix
+
+The flake builds the server with [crane](https://github.com/ipetkov/crane)
+for `aarch64-darwin`, `x86_64-linux` and `aarch64-linux`, with pre-built
+artifacts served from the `otelview` Cachix cache (advertised through the
+flake's `nixConfig`, so Nix offers it automatically):
+
+```sh
+# Run without installing
+nix run github:tsirysndr/otelview-postgres
+
+# Install into your profile
+nix profile install github:tsirysndr/otelview-postgres
+
+# Or from a checkout
+nix build .#otelview-postgres
+./result/bin/otelview-postgres
+```
+
+`nix develop` drops into a shell with the Rust toolchain, `protoc` and
+PostgreSQL client tools. The `nix` GitHub workflow (manually triggered)
+builds all three systems and pushes the results to Cachix.
+
 ## Run
 
 `DATABASE_URL` is required. The schema and indexes are created automatically at
@@ -119,56 +173,3 @@ TEST_DATABASE_URL='postgres://postgres@localhost:5432/otelview_test' cargo test
 The `ci` workflow runs both on every push, with PostgreSQL 17 as a service
 container.
 
-## Install with Nix
-
-The flake builds the server with [crane](https://github.com/ipetkov/crane)
-for `aarch64-darwin`, `x86_64-linux` and `aarch64-linux`, with pre-built
-artifacts served from the `otelview` Cachix cache (advertised through the
-flake's `nixConfig`, so Nix offers it automatically):
-
-```sh
-# Run without installing
-nix run github:tsirysndr/otelview-postgres
-
-# Install into your profile
-nix profile install github:tsirysndr/otelview-postgres
-
-# Or from a checkout
-nix build .#otelview-postgres
-./result/bin/otelview-postgres
-```
-
-`nix develop` drops into a shell with the Rust toolchain, `protoc` and
-PostgreSQL client tools. The `nix` GitHub workflow (manually triggered)
-builds all three systems and pushes the results to Cachix.
-
-## Install a release
-
-The installer detects macOS ARM64, Linux x86_64, or Linux ARM64 and verifies the
-download against the release checksums:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/tsirysndr/otelview-postgres/main/install.sh | sh
-```
-
-A root Linux installation also places the unit at
-`/etc/systemd/system/otelview-postgres.service` and creates a private
-environment file. Install system-wide, configure, and start it with:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/tsirysndr/otelview-postgres/main/install.sh | sudo sh
-sudo editor /etc/otelview-postgres/env
-sudo systemctl enable --now otelview-postgres
-sudo systemctl status otelview-postgres
-```
-
-The installer intentionally does not start the service until `DATABASE_URL` is
-configured. Set `OTELVIEW_POSTGRES_VERSION=v0.1.2` to install a particular
-tag, `INSTALL_DIR` to change the binary destination, or `INSTALL_SYSTEMD=0` to
-skip the unit.
-
-Tags matching `v*` trigger release builds for Darwin ARM64, Linux x86_64, and
-Linux ARM64. The workflow publishes all three archives and `SHA256SUMS` to the
-corresponding GitHub release.
