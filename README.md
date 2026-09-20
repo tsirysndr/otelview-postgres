@@ -44,6 +44,8 @@ Optional environment variables:
 | `LISTEN_ADDR` | `0.0.0.0:17271` | Combined OTLP, Jaeger and otelview gRPC address |
 | `DATABASE_MAX_CONNECTIONS` | `20` | SQLx pool size (applied to each pool) |
 | `MAX_SEARCH_DEPTH` | `1000` | Upper bound for trace and log searches |
+| `RETENTION` | unset | Delete telemetry older than this: `36h`, `7d`, `2w`, `1mo` (months are 30 days). Unset keeps everything |
+| `RETENTION_SWEEP_INTERVAL` | `1h` | How often the retention sweep runs |
 | `RUST_LOG` | `otelview_postgres=info` | Log filter |
 
 Every gRPC request emits a start event, a completion event with busy/idle

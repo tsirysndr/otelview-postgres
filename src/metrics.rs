@@ -225,8 +225,32 @@ impl Store {
             .await
             .context("list metric names")?;
 
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
+        // Per-name lookups run concurrently: each is index-cheap but costs a
+        // round-trip, and against a remote database ~50 sequential
+        // round-trips added up to ~10s for the metric list on their own.
+        // JoinSet rather than a semaphore — the pool's max_connections is
+        // already the concurrency ceiling.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let store = self.clone();
+            tasks.spawn(async move {
+                let info = store.metric_info(name).await;
+                (index, info)
+            });
+        }
+        let mut out: Vec<Option<MetricInfo>> = std::iter::repeat_with(|| None)
+            .take(tasks.len())
+            .collect();
+        while let Some(joined) = tasks.join_next().await {
+            let (index, info) = joined.context("metric lookup task")?;
+            out[index] = Some(info?);
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
+    /// Descriptor and reporting services for one metric name.
+    async fn metric_info(&self, name: String) -> Result<MetricInfo> {
+        {
             let (sql, values) = Query::select()
                 .columns([
                     MetricPoints::Description,
@@ -269,15 +293,14 @@ impl Store {
             .map(|r| r.get("v"))
             .collect();
 
-            out.push(MetricInfo {
+            Ok(MetricInfo {
                 name,
                 description: row.try_get("description")?,
                 unit: row.try_get("unit")?,
                 metric_type: row.try_get("metric_type")?,
                 services,
-            });
+            })
         }
-        Ok(out)
     }
 
 

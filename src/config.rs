@@ -24,4 +24,14 @@ pub struct Config {
     /// Safety ceiling for Jaeger search depth.
     #[arg(long, env = "MAX_SEARCH_DEPTH", default_value_t = 1000)]
     pub max_search_depth: u64,
+
+    /// How long telemetry lives before a background sweep deletes it, e.g.
+    /// "36h", "7d", "2w", "1mo" (months count as 30 days). Unset keeps
+    /// everything forever.
+    #[arg(long, env = "RETENTION")]
+    pub retention: Option<String>,
+
+    /// How often the retention sweep runs. Same format as RETENTION.
+    #[arg(long, env = "RETENTION_SWEEP_INTERVAL", default_value = "1h")]
+    pub retention_sweep_interval: String,
 }

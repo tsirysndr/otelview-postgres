@@ -64,6 +64,21 @@ async fn main() -> anyhow::Result<()> {
     };
     let store = Store::new(primary, reader, config.max_search_depth);
     store.migrate().await?;
+
+    // Retention runs beside the server, not in its request path. Parse
+    // failures are refused at startup: a typo silently keeping data forever
+    // is exactly the failure mode a retention knob exists to prevent.
+    if let Some(raw) = config.retention.as_deref().filter(|r| !r.trim().is_empty()) {
+        let retention = otelview_postgres::retention::parse_retention(raw)
+            .context("parse RETENTION")?;
+        let every =
+            otelview_postgres::retention::parse_retention(&config.retention_sweep_interval)
+                .context("parse RETENTION_SWEEP_INTERVAL")?;
+        tokio::spawn(store.clone().run_retention(retention, every));
+    } else {
+        tracing::info!("RETENTION not set: telemetry is kept forever");
+    }
+
     let service = StorageServer::new(store);
 
     println!("{}", startup_banner(address));

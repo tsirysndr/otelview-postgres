@@ -4,5 +4,6 @@ pub mod diagnostics;
 pub mod logs;
 pub mod metrics;
 pub mod proto;
+pub mod retention;
 pub mod server;
 pub mod store;
