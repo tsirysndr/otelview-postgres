@@ -106,6 +106,19 @@ cargo test
 cargo build --release
 ```
 
+Unit tests need no database. The integration suite in `tests/integration.rs`
+exercises the full store — span upsert and search, log search and severity /
+trace-correlation filters, metric downsampling, stats, the read-only pool and
+the retention sweep — against a real PostgreSQL when `TEST_DATABASE_URL` is
+set, and skips itself otherwise:
+
+```sh
+TEST_DATABASE_URL='postgres://postgres@localhost:5432/otelview_test' cargo test
+```
+
+The `ci` workflow runs both on every push, with PostgreSQL 17 as a service
+container.
+
 ## Install with Nix
 
 The flake builds the server with [crane](https://github.com/ipetkov/crane)

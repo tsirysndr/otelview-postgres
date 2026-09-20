@@ -111,6 +111,16 @@ impl Store {
         }
     }
 
+    /// The pool queries run on (the replica when one is configured).
+    pub fn reader_pool(&self) -> &PgPool {
+        &self.reader
+    }
+
+    /// The pool writes and migrations run on.
+    pub fn primary_pool(&self) -> &PgPool {
+        &self.primary
+    }
+
     pub async fn migrate(&self) -> Result<()> {
         for (name, sql) in [
             (
