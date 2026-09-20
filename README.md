@@ -1,4 +1,7 @@
 # otelview-postgres
+[![ci](https://github.com/tsirysndr/otelview-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/tsirysndr/otelview-postgres/actions/workflows/ci.yml)
+[![nix](https://github.com/tsirysndr/otelview-postgres/actions/workflows/nix.yml/badge.svg)](https://github.com/tsirysndr/otelview-postgres/actions/workflows/nix.yml)
+
 
 PostgreSQL remote storage for all three OpenTelemetry signals — traces, logs
 and metrics — implemented in Rust with Tonic, SQLx, and SeaQuery. Started as a
