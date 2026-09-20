@@ -12,7 +12,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Sum, Summary, metric, number_data_point,
 };
 use prost::Message;
-use sea_query::{Alias, Expr, ExprTrait, Iden, Order, PostgresQueryBuilder, Query};
+use sea_query::{Expr, ExprTrait, Iden, Order, PostgresQueryBuilder, Query};
 use sea_query_sqlx::SqlxBinder;
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, Row};
@@ -154,28 +154,76 @@ impl Store {
         if query.metric_name.is_empty() {
             return Err(anyhow!("metric_name is required"));
         }
-        let mut select = Query::select();
-        select
-            .columns([MetricPoints::Payload, MetricPoints::ServiceName])
-            .expr_as(
-                Expr::col(MetricPoints::Attributes).cast_as(Alias::new("TEXT")),
-                Alias::new("series_attrs"),
-            )
-            .from(MetricPoints::Table)
-            .and_where(Expr::col(MetricPoints::MetricName).eq(&query.metric_name))
-            .order_by(MetricPoints::TimeUnixNano, Order::Asc)
-            .limit(MAX_METRIC_ROWS);
-        if !query.service_name.is_empty() {
-            select.and_where(Expr::col(MetricPoints::ServiceName).eq(&query.service_name));
+        let requested_points = if query.max_points <= 0 {
+            DEFAULT_MAX_POINTS
+        } else {
+            query.max_points as usize
+        };
+
+        // The downsampling is pushed into SQL: shipping every raw point of
+        // the window and thinning afterwards moved megabytes of payload per
+        // chart — the metric graph spent seconds in transfer for points that
+        // were immediately discarded. Every k-th row per series (plus each
+        // series' last) survives, sized so a series stays a little above the
+        // requested budget; the exact evenly-spaced pass below then trims to
+        // it. Filters and identifiers are bound; the SQL itself is static.
+        let mut conditions = String::from("metric_name = $1");
+        let mut bind_index = 2;
+        let service_bind = if query.service_name.is_empty() {
+            0
+        } else {
+            conditions.push_str(&format!(" AND service_name = ${bind_index}"));
+            bind_index += 1;
+            bind_index - 1
+        };
+        let time_min = query.time_min.as_ref().map(timestamp_to_nanos).transpose()?;
+        let min_bind = if time_min.is_some() {
+            conditions.push_str(&format!(" AND time_unix_nano >= ${bind_index}"));
+            bind_index += 1;
+            bind_index - 1
+        } else {
+            0
+        };
+        let time_max = query.time_max.as_ref().map(timestamp_to_nanos).transpose()?;
+        let max_bind = if time_max.is_some() {
+            conditions.push_str(&format!(" AND time_unix_nano < ${bind_index}"));
+            bind_index += 1;
+            bind_index - 1
+        } else {
+            0
+        };
+        let points_bind = bind_index;
+
+        let sql = format!(
+            r#"SELECT payload, service_name, series_attrs FROM (
+                 SELECT payload, service_name, attributes::TEXT AS series_attrs,
+                        time_unix_nano,
+                        row_number() OVER w AS rn,
+                        count(*) OVER (PARTITION BY service_name, attributes) AS cnt
+                 FROM metric_points
+                 WHERE {conditions}
+                 WINDOW w AS (PARTITION BY service_name, attributes
+                              ORDER BY time_unix_nano)
+               ) sampled
+               WHERE cnt <= ${points_bind}
+                  OR rn % (cnt / ${points_bind} + 1) = 1
+                  OR rn = cnt
+               ORDER BY time_unix_nano ASC
+               LIMIT {MAX_METRIC_ROWS}"#,
+        );
+        let mut db_query = sqlx::query(AssertSqlSafe(sql)).bind(&query.metric_name);
+        // Bound in the same order the placeholders were appended.
+        for index in 2..bind_index {
+            if index == service_bind {
+                db_query = db_query.bind(&query.service_name);
+            } else if index == min_bind {
+                db_query = db_query.bind(time_min.unwrap());
+            } else if index == max_bind {
+                db_query = db_query.bind(time_max.unwrap());
+            }
         }
-        if let Some(ts) = &query.time_min {
-            select.and_where(Expr::col(MetricPoints::TimeUnixNano).gte(timestamp_to_nanos(ts)?));
-        }
-        if let Some(ts) = &query.time_max {
-            select.and_where(Expr::col(MetricPoints::TimeUnixNano).lt(timestamp_to_nanos(ts)?));
-        }
-        let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
-        let rows = sqlx::query_with(AssertSqlSafe(sql), values)
+        db_query = db_query.bind(requested_points as i64);
+        let rows = db_query
             .fetch_all(&self.reader)
             .await
             .context("query metric points")?;
@@ -191,14 +239,9 @@ impl Store {
             series.entry(key).or_default().push(index);
         }
 
-        let max_points = if query.max_points <= 0 {
-            DEFAULT_MAX_POINTS
-        } else {
-            query.max_points as usize
-        };
         let mut keep = vec![false; payloads.len()];
         for indices in series.into_values() {
-            for index in downsample(&indices, max_points) {
+            for index in downsample(&indices, requested_points) {
                 keep[index] = true;
             }
         }
