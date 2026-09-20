@@ -182,18 +182,9 @@ impl Store {
     }
 
     pub async fn log_services(&self) -> Result<Vec<String>> {
-        let (sql, values) = Query::select()
-            .column(Logs::ServiceName)
-            .distinct()
-            .from(Logs::Table)
-            .order_by(Logs::ServiceName, Order::Asc)
-            .build_sqlx(PostgresQueryBuilder);
-        Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.reader)
-            .await?
-            .into_iter()
-            .map(|r| r.get("service_name"))
-            .collect())
+        // Loose index scan over (service_name, time): a plain DISTINCT reads
+        // every log row. See `Store::distinct_indexed`.
+        self.distinct_indexed(Logs::Table, Logs::ServiceName).await
     }
 }
 

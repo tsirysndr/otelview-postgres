@@ -15,15 +15,19 @@ pub struct Stats {
 
 impl Store {
     pub async fn stats(&self) -> Result<Stats> {
-        // Static SQL, no user input.
+        // Planner estimates, not COUNT(*): exact counts scan every row of
+        // every table, and with millions of points that took the better part
+        // of two minutes — for a diagnostics tile. n_live_tup tracks inserts
+        // as they happen and autovacuum/ANALYZE trues it up, so it is within
+        // a few percent on an append-only workload, which is all a counter in
+        // a status view needs. Static SQL, no user input.
         let row = sqlx::query(
-            "SELECT (SELECT COUNT(*) FROM spans) AS spans, \
-                    (SELECT COUNT(*) FROM logs) AS logs, \
-                    (SELECT COUNT(*) FROM metric_points) AS metric_points, \
-                    (SELECT COUNT(*) FROM (SELECT service_name FROM spans \
-                                           UNION SELECT service_name FROM logs \
-                                           UNION SELECT service_name FROM metric_points) s) \
-                        AS services",
+            "SELECT COALESCE((SELECT n_live_tup FROM pg_stat_user_tables \
+                              WHERE relname = 'spans'), 0) AS spans, \
+                    COALESCE((SELECT n_live_tup FROM pg_stat_user_tables \
+                              WHERE relname = 'logs'), 0) AS logs, \
+                    COALESCE((SELECT n_live_tup FROM pg_stat_user_tables \
+                              WHERE relname = 'metric_points'), 0) AS metric_points",
         )
         .fetch_one(&self.reader)
         .await
@@ -32,11 +36,19 @@ impl Store {
             let value: i64 = row.try_get(name)?;
             Ok(value.max(0) as u64)
         };
+
+        // Exact, but cheap: each list is a loose index scan, a handful of
+        // probes per table rather than a walk over it.
+        let mut services: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        services.extend(self.services().await?);
+        services.extend(self.log_services().await?);
+        services.extend(self.metric_services().await?);
+
         Ok(Stats {
             spans: get("spans")?,
             logs: get("logs")?,
             metric_points: get("metric_points")?,
-            services: get("services")?,
+            services: services.len() as u64,
         })
     }
 }

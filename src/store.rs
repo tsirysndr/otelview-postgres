@@ -125,6 +125,10 @@ impl Store {
                 "0003_create_metric_points",
                 include_str!("../migrations/0003_create_metric_points.sql"),
             ),
+            (
+                "0004_start_index",
+                include_str!("../migrations/0004_start_index.sql"),
+            ),
         ] {
             sqlx::raw_sql(sql)
                 .execute(&self.primary)
@@ -287,17 +291,44 @@ impl Store {
     }
 
     pub async fn services(&self) -> Result<Vec<String>> {
-        let (sql, values) = Query::select()
-            .column(Spans::ServiceName)
-            .distinct()
-            .from(Spans::Table)
-            .order_by(Spans::ServiceName, Order::Asc)
-            .build_sqlx(PostgresQueryBuilder);
-        Ok(sqlx::query_with(AssertSqlSafe(sql), values)
+        self.distinct_indexed(Spans::Table, Spans::ServiceName).await
+    }
+
+    /// The distinct values of one indexed TEXT column, by loose index scan.
+    ///
+    /// `SELECT DISTINCT col` reads every row — Postgres has no skip scan — and
+    /// at a few hundred thousand spans over remote storage that took ~50s, so
+    /// listing the services took longer than any client waits and the UI
+    /// showed nothing at all. The recursive CTE instead probes the column's
+    /// index once per distinct value (`> previous, LIMIT 1`), a handful of
+    /// lookups regardless of row count.
+    ///
+    /// The column must be the leading key of some index or this silently
+    /// degrades back into per-value scans.
+    pub(crate) async fn distinct_indexed(
+        &self,
+        table: impl Iden + Copy,
+        column: impl Iden + Copy,
+    ) -> Result<Vec<String>> {
+        // sea-query has no recursive-CTE builder. The identifiers come from
+        // the compile-time Iden enums, not from input; quoted by hand since
+        // `Iden::quoted` only returns the bare name.
+        let t = format!("\"{}\"", table.unquoted());
+        let c = format!("\"{}\"", column.unquoted());
+        let sql = format!(
+            r#"WITH RECURSIVE walk AS (
+                 (SELECT {c} AS v FROM {t} ORDER BY {c} LIMIT 1)
+                 UNION ALL
+                 SELECT (SELECT {c} FROM {t} WHERE {c} > walk.v ORDER BY {c} LIMIT 1)
+                 FROM walk WHERE walk.v IS NOT NULL
+               )
+               SELECT v FROM walk WHERE v IS NOT NULL ORDER BY v"#,
+        );
+        Ok(sqlx::query(AssertSqlSafe(sql))
             .fetch_all(&self.reader)
             .await?
             .into_iter()
-            .map(|r| r.get("service_name"))
+            .map(|r| r.get("v"))
             .collect())
     }
 

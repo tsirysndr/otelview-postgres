@@ -4,7 +4,7 @@
 //! metric descriptor with just that point), so reads stream original OTLP
 //! data losslessly.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
 use opentelemetry_proto::tonic::metrics::v1::{
@@ -210,72 +210,80 @@ impl Store {
     }
 
     /// One descriptor per metric name, with the services reporting it.
+    ///
+    /// Both halves used whole-table DISTINCTs, and this is the largest table
+    /// by an order of magnitude — millions of points within a day of normal
+    /// ingest — so the metric list alone could take the better part of a
+    /// minute. Instead: walk the distinct names off the (metric_name, …)
+    /// index, then per name probe one descriptor row and skip-scan its
+    /// services off the (metric_name, service_name, …) index prefix. The
+    /// work is now proportional to metrics × services, dozens of index
+    /// probes, not to the point count.
     pub async fn list_metrics(&self) -> Result<Vec<MetricInfo>> {
-        let (sql, values) = Query::select()
-            .distinct_on([MetricPoints::MetricName])
-            .columns([
-                MetricPoints::MetricName,
-                MetricPoints::Description,
-                MetricPoints::Unit,
-                MetricPoints::MetricType,
-            ])
-            .from(MetricPoints::Table)
-            .order_by(MetricPoints::MetricName, Order::Asc)
-            .order_by(Alias::new("id"), Order::Desc)
-            .build_sqlx(PostgresQueryBuilder);
-        let descriptors = sqlx::query_with(AssertSqlSafe(sql), values)
+        let names = self
+            .distinct_indexed(MetricPoints::Table, MetricPoints::MetricName)
+            .await
+            .context("list metric names")?;
+
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let (sql, values) = Query::select()
+                .columns([
+                    MetricPoints::Description,
+                    MetricPoints::Unit,
+                    MetricPoints::MetricType,
+                ])
+                .from(MetricPoints::Table)
+                .and_where(Expr::col(MetricPoints::MetricName).eq(&name))
+                .order_by(Alias::new("id"), Order::Desc)
+                .limit(1)
+                .build_sqlx(PostgresQueryBuilder);
+            let row = sqlx::query_with(AssertSqlSafe(sql), values)
+                .fetch_one(&self.reader)
+                .await
+                .context("fetch metric descriptor")?;
+
+            // Distinct services for this one metric: skip along the
+            // (metric_name, service_name) index prefix, one probe each.
+            let services: Vec<String> = sqlx::query(AssertSqlSafe(
+                r#"WITH RECURSIVE walk AS (
+                     (SELECT service_name AS v FROM metric_points
+                      WHERE metric_name = $1 ORDER BY service_name LIMIT 1)
+                     UNION ALL
+                     SELECT (SELECT service_name FROM metric_points
+                             WHERE metric_name = $1 AND service_name > walk.v
+                             ORDER BY service_name LIMIT 1)
+                     FROM walk WHERE walk.v IS NOT NULL
+                   )
+                   SELECT v FROM walk WHERE v IS NOT NULL ORDER BY v"#
+                    .to_string(),
+            ))
+            .bind(&name)
             .fetch_all(&self.reader)
             .await
-            .context("list metric descriptors")?;
-
-        let (sql, values) = Query::select()
-            .columns([MetricPoints::MetricName, MetricPoints::ServiceName])
-            .distinct()
-            .from(MetricPoints::Table)
-            .order_by(MetricPoints::MetricName, Order::Asc)
-            .order_by(MetricPoints::ServiceName, Order::Asc)
-            .build_sqlx(PostgresQueryBuilder);
-        let pairs = sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.reader)
-            .await
-            .context("list metric services")?;
-        let mut services: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for row in pairs {
-            services
-                .entry(row.try_get("metric_name")?)
-                .or_default()
-                .push(row.try_get("service_name")?);
-        }
-
-        descriptors
+            .context("list metric services")?
             .into_iter()
-            .map(|row| {
-                let name: String = row.try_get("metric_name")?;
-                let info = MetricInfo {
-                    services: services.remove(&name).unwrap_or_default(),
-                    name,
-                    description: row.try_get("description")?,
-                    unit: row.try_get("unit")?,
-                    metric_type: row.try_get("metric_type")?,
-                };
-                Ok(info)
-            })
-            .collect()
+            .map(|r| r.get("v"))
+            .collect();
+
+            out.push(MetricInfo {
+                name,
+                description: row.try_get("description")?,
+                unit: row.try_get("unit")?,
+                metric_type: row.try_get("metric_type")?,
+                services,
+            });
+        }
+        Ok(out)
     }
 
+
     pub async fn metric_services(&self) -> Result<Vec<String>> {
-        let (sql, values) = Query::select()
-            .column(MetricPoints::ServiceName)
-            .distinct()
-            .from(MetricPoints::Table)
-            .order_by(MetricPoints::ServiceName, Order::Asc)
-            .build_sqlx(PostgresQueryBuilder);
-        Ok(sqlx::query_with(AssertSqlSafe(sql), values)
-            .fetch_all(&self.reader)
-            .await?
-            .into_iter()
-            .map(|r| r.get("service_name"))
-            .collect())
+        // Loose index scan over the service_name index: a plain DISTINCT
+        // reads every point, and this is the biggest table by far. See
+        // `Store::distinct_indexed`.
+        self.distinct_indexed(MetricPoints::Table, MetricPoints::ServiceName)
+            .await
     }
 }
 
