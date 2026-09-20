@@ -75,6 +75,29 @@ nix build .#otelview-postgres
 ./result/bin/otelview-postgres
 ```
 
+### Binary cache (Cachix)
+
+The flake advertises the cache through its `nixConfig`, so Nix asks once
+whether to trust it. To enable it permanently — required when your user is
+not in `trusted-users`, and what CI should do — use
+[Cachix](https://docs.cachix.org) directly:
+
+```sh
+# One-time: install the cachix CLI, then
+cachix use otelview
+```
+
+Or add the cache to your Nix configuration by hand
+(`/etc/nix/nix.conf`, or `nix.settings` on NixOS):
+
+```
+extra-substituters = https://otelview.cachix.org
+extra-trusted-public-keys = otelview.cachix.org-1:+Twrf64f2rg+cTAYU2MikV/hGMpHxnHK6l6yLvrseP4=
+```
+
+With the cache enabled, `nix run`/`nix build` download the pre-built
+binaries pushed by the `nix` workflow instead of compiling.
+
 `nix develop` drops into a shell with the Rust toolchain, `protoc` and
 PostgreSQL client tools. The `nix` GitHub workflow (manually triggered)
 builds all three systems and pushes the results to Cachix.
