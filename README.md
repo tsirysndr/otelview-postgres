@@ -106,6 +106,29 @@ cargo test
 cargo build --release
 ```
 
+## Install with Nix
+
+The flake builds the server with [crane](https://github.com/ipetkov/crane)
+for `aarch64-darwin`, `x86_64-linux` and `aarch64-linux`, with pre-built
+artifacts served from the `otelview` Cachix cache (advertised through the
+flake's `nixConfig`, so Nix offers it automatically):
+
+```sh
+# Run without installing
+nix run github:tsirysndr/otelview-postgres
+
+# Install into your profile
+nix profile install github:tsirysndr/otelview-postgres
+
+# Or from a checkout
+nix build .#otelview-postgres
+./result/bin/otelview-postgres
+```
+
+`nix develop` drops into a shell with the Rust toolchain, `protoc` and
+PostgreSQL client tools. The `nix` GitHub workflow (manually triggered)
+builds all three systems and pushes the results to Cachix.
+
 ## Install a release
 
 The installer detects macOS ARM64, Linux x86_64, or Linux ARM64 and verifies the
